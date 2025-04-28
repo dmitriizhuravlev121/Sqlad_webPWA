@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <script src="/env.js"></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <title>QR Inventory App</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 10px; text-align: center; }
+    #video { width: 100%; max-width: 500px; border: 1px solid #ccc; }
+    #result { margin: 20px 0; }
+    input[type="number"] { padding: 5px; margin: 10px; width: 100px; }
+    button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <h1>Сканирование QR-кода</h1>
+  <video id="video" autoplay class="hidden"></video>
+  <div id="result" class="hidden">
+    <p id="item-name"></p>
+    <button id="write-off">Списать</button>
+    <button id="add-stock">Зачислить</button>
+    <div id="quantity-input" class="hidden">
+      <label for="quantity">Количество:</label>
+      <input type="number" id="quantity" min="1" value="1">
+      <button id="confirm">Подтвердить</button>
+      <button id="cancel">Отмена</button>
+    </div>
+  </div>
+  <p id="error" class="hidden"></p>
+
+  <!-- Заглушка для переменных окружения -->
+  <script>
+    window.env = {
+      AIRTABLE_API_KEY: 'AIRTABLE_API_KEY', // Замените на ваш API-ключ Airtable
+      AIRTABLE_BASE_ID: 'AIRTABLE_BASE_ID'  // Замените на ID вашей базы Airtable
+    };
+  </script>
+
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <script src="https://cdn.pyodide.org/v0.23.4/full/pyodide.js"></script>
+  <script>
+    // Service Worker for PWA
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js');
+    }
+
+    // Camera and QR code scanning
+    const video = document.getElementById('video');
+    const result = document.getElementById('result');
+    const itemName = document.getElementById('item-name');
+    const writeOff = document.getElementById('write-off');
+    const addStock = document.getElementById('add-stock');
+    const quantityInput = document.getElementById('quantity-input');
+    const quantity = document.getElementById('quantity');
+    const confirm = document.getElementById('confirm');
+    const cancel = document.getElementById('cancel');
+    const error = document.getElementById('error');
+    let stream;
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        video.srcObject = stream;
+        video.classList.remove('hidden');
+        scanQR();
+      } catch (err) {
+        showError('Ошибка доступа к камере: ' + err.message);
+      }
+    }
+
+    function stopCamera() {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+      video.classList.add('hidden');
+    }
+
+    function showError(message) {
+      error.textContent = message;
+      error.classList.remove('hidden');
+      video.classList.remove('hidden');
+      result.classList.add('hidden');
+      quantityInput.classList.add('hidden');
+    }
+
+    function scanQR() {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height);
+      if (code) {
+        try {
+          const data = JSON.parse(code.data);
+          if (data.id && data.name) {
+            stopCamera();
+            itemName.textContent = `Товар: ${data.name}`;
+            result.classList.remove('hidden');
+            error.classList.add('hidden');
+            window.qrData = data;
+          } else {
+            showError('Некорректные данные в QR-коде');
+          }
+        } catch (e) {
+          showError('Ошибка обработки QR-кода');
+        }
+      } else {
+        requestAnimationFrame(scanQR);
+      }
+    }
+
+    writeOff.onclick = () => {
+      quantityInput.classList.remove('hidden');
+      window.action = 'write-off';
+    };
+
+    addStock.onclick = () => {
+      quantityInput.classList.remove('hidden');
+      window.action = 'add-stock';
+    };
+
+    cancel.onclick = () => {
+      quantityInput.classList.add('hidden');
+      result.classList.add('hidden');
+      startCamera();
+    };
+
+    confirm.onclick = () => {
+      const qty = parseInt(quantity.value);
+      if (qty > 0) {
+        pyodide.runPythonAsync(`
+          from js import window, fetch
+          import json
+          import asyncio
+
+          async def save_to_airtable():
+              data = window.qrData
+              action = window.action
+              qty = ${qty}
+              table = 'Списания' if action == 'write-off' else 'Поставки'
+              payload = {
+                  'records': [{
+                      'fields': {
+                          'Дата': '${new Date().toISOString().split('T')[0]}',
+                          'Товар': [data.id],  # Отправляем recordId как массив для связанного поля
+                          'Количество': qty
+                      }
+                  }]
+              }
+
+              # Офлайн-режим: сохранить локально, если нет интернета
+              try:
+                  response = await fetch('https://api.airtable.com/v0/' + window.env.AIRTABLE_BASE_ID + '/' + table, {
+                      method: 'POST',
+                      headers: {
+                          'Authorization': 'Bearer ' + window.env.AIRTABLE_API_KEY,
+                          'Content-Type': 'application/json'
+                      },
+                      body: json.dumps(payload)
+                  })
+                  if response.ok:
+                      window.alert('Запись успешно создана!')
+                      window.location.reload()
+                  else:
+                      raise Exception('Ошибка Airtable')
+              except Exception as e:
+                  # Сохранить в IndexedDB
+                  db = await window.indexedDB.open('offlineQueue', 1)
+                  db.onupgradeneeded = lambda event: event.target.result.createObjectStore('records')
+                  tx = db.transaction(['records'], 'readwrite')
+                  store = tx.objectStore('records')
+                  await store.add(payload)
+                  window.alert('Нет интернета. Данные сохранены локально и будут отправлены позже.')
+                  window.location.reload()
+
+          asyncio.ensure_future(save_to_airtable())
+        `);
+      } else {
+        showError('Укажите корректное количество');
+      }
+    };
+
+    // Загрузка Pyodide и запуск камеры
+    async function init() {
+      window.pyodide = await loadPyodide();
+      if (!window.env.AIRTABLE_API_KEY || !window.env.AIRTABLE_BASE_ID) {
+        showError('Ошибка: API-ключ или ID базы Airtable не настроены');
+        return;
+      }
+      startCamera();
+
+      // Синхронизация офлайн-данных при восстановлении соединения
+      navigator.serviceWorker.addEventListener('message', event => {
+        if (event.data.type === 'SYNC') {
+          pyodide.runPythonAsync(`
+            from js import window, fetch
+            import json
+            import asyncio
+
+            async def sync_offline():
+                db = await window.indexedDB.open('offlineQueue', 1)
+                tx = db.transaction(['records'], 'readwrite')
+                store = tx.objectStore('records')
+                records = await store.getAll()
+                for record in records:
+                    table = 'Списания' if record.records[0].fields['Товар'][0] in [r.records[0].fields['Товар'][0] for r in await store.getAll()] else 'Поставки'
+                    try:
+                        response = await fetch('https://api.airtable.com/v0/' + window.env.AIRTABLE_BASE_ID + '/' + table, {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': 'Bearer ' + window.env.AIRTABLE_API_KEY,
+                                'Content-Type': 'application/json'
+                            },
+                            body: json.dumps(record)
+                        })
+                        if response.ok:
+                            tx = db.transaction(['records'], 'readwrite')
+                            store = tx.objectStore('records')
+                            await store.delete(record)
+                    except:
+                        pass
+
+            asyncio.ensure_future(sync_offline())
+          `);
+        }
+      });
+    }
+
+    init();
+  </script>
+
+  <script type="text/py">
+    # Python-код уже встроен в JavaScript для упрощения
+  </script>
+</body>
+</html>
